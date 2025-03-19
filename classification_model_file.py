@@ -2,118 +2,134 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class MinimalPatchEmbed(nn.Module):
-    def __init__(self, img_size, patch_size, in_channels, embed_dim):
-        super(MinimalPatchEmbed, self).__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-
-        self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-        
-        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = downsample
 
     def forward(self, x):
-        x = self.proj(x)  # Shape: [batch_size, embed_dim, grid_size[0], grid_size[1]]
-        x = x.flatten(2)  # Shape: [batch_size, embed_dim, num_patches]
-        x = x.transpose(1, 2)  # Shape: [batch_size, num_patches, embed_dim]
-        return x
+        identity = x
+        if self.downsample is not None:
+            identity = self.downsample(x)
 
-class MinimalTransformerEncoder(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_layers, hidden_dim):
-        super(MinimalTransformerEncoder, self).__init__()
-        encoder_layers = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=num_heads, 
-            dim_feedforward=hidden_dim,
-            batch_first = True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class CustomResNet(nn.Module):
+    def __init__(self, block, layers, feature_dim):
+        super(CustomResNet, self).__init__()
+        self.in_channels = 64
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.feature_dim = feature_dim
+        self.fc = nn.Linear(512, feature_dim)
+
+    def _make_layer(self, block, out_channels, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.in_channels != out_channels:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+
+        layers = []
+        layers.append(block(self.in_channels, out_channels, stride, downsample))
+        self.in_channels = out_channels
+        for _ in range(1, blocks):
+            layers.append(block(out_channels, out_channels))
+
+        return nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x.permute(1, 0, 2)  # Transformer expects (seq_len, batch, embed_dim)
-        x = self.transformer_encoder(x)
-        x = x.permute(1, 0, 2)  # Back to (batch, seq_len, embed_dim)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+
         return x
 
-class MinimalViT(nn.Module):
-    def __init__(self, img_size, patch_size, in_channels, embed_dim, num_heads, num_layers, hidden_dim, num_classes):
-        super(MinimalViT, self).__init__()
-        self.patch_embed = MinimalPatchEmbed(img_size, patch_size, in_channels, embed_dim)
-        self.transformer_encoder = MinimalTransformerEncoder(embed_dim, num_heads, num_layers, hidden_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.positional_encoding = nn.Parameter(torch.zeros(1, self.patch_embed.num_patches + 1, embed_dim))
-        self.fc = nn.Linear(embed_dim, num_classes)
+
+class SignalRNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers, feature_dim):
+        super(SignalRNN, self).__init__()
+        self.rnn = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc1 = nn.Linear(hidden_dim, 512)
+        self.fc2 = nn.Linear(512, feature_dim)
 
     def forward(self, x):
-        batch_size = x.size(0)
-        x = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x += self.positional_encoding
-        x = self.transformer_encoder(x)
-        cls_output = x[:, 0]  # Use the output corresponding to the [CLS] token
-        x = self.fc(cls_output)
-        return x
-
-class MinimalSignalTransformer(nn.Module):
-    def __init__(self, signal_len, embed_dim=16, num_heads=2, num_layers=1, hidden_dim=32):
-        super(MinimalSignalTransformer, self).__init__()
-        self.embed = nn.Linear(1, embed_dim)  # Embedding for 1D signal input
         
-        encoder_layers = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=hidden_dim, batch_first = True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        
-        self.fc = nn.Linear(embed_dim, 32)  # Adjust output dimension
+        out, _ = self.rnn(x)
+        # out = out[:, -1, :]
+        out = F.relu(self.fc1(out))
+        out = self.fc2(out)
+        return out
 
-    def forward(self, signal):
-        signal = signal.unsqueeze(-1)  # Add channel dimension
-        embedded_signal = self.embed(signal)
-        transformer_output = self.transformer_encoder(embedded_signal.permute(1, 0, 2))  # Permute for Transformer: [seq_len, batch, embed_dim]
-        pooled_output = transformer_output.mean(dim=0)  # Pooling over the sequence length
-        signal_features = self.fc(pooled_output)
-        return signal_features
 
 class CLASSIFICATION_MODEL(nn.Module):
-    def __init__(self, list_of_classes, signal_len, img_size=(425, 650)):
+    def __init__(self, list_of_classes, signal_len, img_size=(425,550)):
         super(CLASSIFICATION_MODEL, self).__init__()
-        
         self.list_of_classes = list_of_classes
         self.num_classes = len(self.list_of_classes)
-        
-        # Image and Signal Processing Modules
-        self.image_processor = MinimalViT(
-            img_size=img_size,
-            patch_size=(32, 32),  # Larger patch size for simplicity
-            in_channels=3,
-            embed_dim=128,
-            num_heads=2,
-            num_layers=2,
-            hidden_dim=256,
-            num_classes=self.num_classes
-        )
-        
-        self.signal_processor = MinimalSignalTransformer(signal_len)
-        
-        # Fully connected layers
-        self.fc1 = nn.Linear(11, 128)  # Adjusted size
-        # self.fc2 = nn.Linear(128, self.num_classes)  # Output layer for classification
-        self.fc2 = nn.Sequential(
-            nn.Linear(128, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, self.num_classes)
-        )
-    
-    def forward(self, image, signal):
-        image_features = self.image_processor(image)
-        # signal_features = self.signal_processor(signal)
+        self.image_feature_dim = 256  # Dimension of the image feature vector
+        self.signal_feature_dim = 256  # Dimension of the signal feature vector
 
-        # combined_features = torch.cat((image_features, signal_features), dim=1) 
-        
-        output = F.relu(self.fc1(image_features))
-        output = torch.sigmoid(self.fc2(output))  # Sigmoid activation for multilabel classification
-        
-        return output
+        self.image_branch = CustomResNet(ResidualBlock, [2, 2, 2, 2], self.image_feature_dim)
+        self.signal_branch = SignalRNN(input_dim=signal_len, hidden_dim=128, num_layers=4, feature_dim=self.signal_feature_dim)
+
+        self.combined_feature_dim = self.image_feature_dim + self.signal_feature_dim
+
+        # Convolutional layers for combined features
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+
+        # Fully connected layers
+        self.fc1 = nn.Linear(256 * 8, 256)  # Adjust input dimension based on the output of conv layers
+        self.fc2 = nn.Linear(256, self.num_classes)
+
+    def forward(self, image, signal):
+        image_features = self.image_branch(image)
+        signal_features = self.signal_branch(signal)
+        combined_features = torch.cat((image_features, signal_features), dim=1)
+
+        # Reshape combined features for convolutional layers
+        combined_features = combined_features.view(combined_features.size(0), 1, 32, 16)  # Example reshape, adjust as needed
+
+        x = self.pool(F.relu(self.conv1(combined_features)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = self.pool(F.relu(self.conv3(x)))
+
+        x = x.view(x.size(0), -1)  # Flatten the tensor
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return torch.sigmoid(x)  # Sigmoid activation for multilabel classification
