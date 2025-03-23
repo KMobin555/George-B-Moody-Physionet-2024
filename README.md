@@ -1,4 +1,4 @@
-# Example code for the George B. Moody PhysioNet Challenge 2024
+# Code for the George B. Moody PhysioNet Challenge 2024
 
 ## What's in this repository?
 
